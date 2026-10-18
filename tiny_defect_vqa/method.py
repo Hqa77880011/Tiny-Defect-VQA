@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .layers import Encoder,region,image_demo
+from .layers import Encoder,region
 
 
 class Model(nn.Module):
@@ -31,8 +31,16 @@ class Model(nn.Module):
 
 
 def demo(seed,n,c):
-    d=image_demo(seed,n);d['mask']=d.pop('y');rng=np.random.default_rng(seed)
-    d['question']=rng.integers(1,c.get('vocabulary',128),(n,6));d['y']=(d['mask'].mean((1,2,3))*c.get('classes',3)).astype('int64').clip(0,c.get('classes',3)-1);return d
+    rng=np.random.default_rng(seed);images=[];masks=[];questions=[];answers=[];groups=[]
+    for scene in range((n+2)//3):
+        image=rng.uniform(.05,.15,(3,32,32)).astype('float32');mask=np.zeros((1,32,32),np.float32)
+        if scene%4:
+            height,width=rng.integers(4,15,size=2);top,left=rng.integers(0,33-height),rng.integers(0,33-width)
+            mask[:,top:top+height,left:left+width]=1;image[:,mask[0]>0]=rng.uniform(.6,.9,(3,1))
+        area=float(mask.mean());location=2 if area==0 else int(np.where(mask[0]>0)[1].mean()>=16)
+        for question,answer in [(1,int(area>0)),(2,location),(3,0 if area==0 else 1 if area<.1 else 2)]:
+            images.append(image.copy());masks.append(mask.copy());questions.append([question,4,0,0,0,0]);answers.append(answer);groups.append(scene)
+    return {'x':np.array(images[:n]),'mask':np.array(masks[:n]),'question':np.array(questions[:n]),'y':np.array(answers[:n]),'group':np.array(groups[:n])}
 
 
 def measure(p,d,c):
