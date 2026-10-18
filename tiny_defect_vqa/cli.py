@@ -142,7 +142,16 @@ def main():
                 best = score
                 torch.save({"state": network.state_dict(), "config": config, "training_groups": np.unique(data.get("group", np.arange(len(data["x"])))).tolist(), "validation_groups": np.unique(validation.get("group", np.arange(len(validation["x"])))).tolist()}, out / "model.pt")
         dump(out / "history.json", history)
-        dump(out / "training.json", {"seconds": time.perf_counter() - start, "best_validation_loss": best})
+        dump(out / "training.json", {
+            "seconds": time.perf_counter() - start,
+            "best_validation_loss": best,
+            "seed": args.seed,
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "learning_rate": args.lr,
+            "device": args.device,
+            "variant": args.variant,
+        })
     elif args.command == "calibrate":
         from scipy.optimize import minimize_scalar
         from scipy.special import softmax
