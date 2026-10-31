@@ -1,6 +1,8 @@
 {
-  "width": 32,
-  "vocabulary": 8,
-  "rank": 16,
-  "classes": 3
+  "width": 128,
+  "vocabulary": 8192,
+  "rank": 128,
+  "classes": 32,
+  "localization_weight": 0.5,
+  "pretrained": false
 }

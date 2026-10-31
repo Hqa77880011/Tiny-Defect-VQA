@@ -1,49 +1,85 @@
-import numpy as np
+"""Five-intent, 32-answer mask-guided MobileNet/Transformer VQA."""
 import torch
 from torch import nn
 from torch.nn import functional as F
-from .layers import Encoder,region
+from .layers import Encoder, region
+
+ANSWER_OFFSETS = (0, 2, 15, 25, 29, 32)
 
 
 class Model(nn.Module):
-    def __init__(self,c):
-        super().__init__();self.c=c;w=c.get('width',32);rank=c.get('rank',16)
-        self.encoder=Encoder(3,w);self.words=nn.Embedding(c.get('vocabulary',128),w,padding_idx=0)
-        self.language=nn.GRU(w,w,batch_first=True);self.mask=nn.Conv2d(w,1,1)
-        self.visual=nn.Linear(w,w);self.query=nn.Linear(w,w);self.attention=nn.Linear(w,1)
-        self.left=nn.Linear(w,rank);self.right=nn.Linear(w,rank);self.fusion=nn.Linear(rank,w)
-        self.gate=nn.Linear(2*w,w);self.norm=nn.LayerNorm(w);self.answer=nn.Linear(w,c.get('classes',3))
-    def forward(self,b):
-        h=self.encoder(b['x']);tokens=h.flatten(2).transpose(1,2);mask=self.mask(h).sigmoid()
-        words=self.words(b['question'].long());language,_=self.language(words)
-        valid=(b['question']!=0).float();q=(language*valid[:,:,None]).sum(1)/valid.sum(1,keepdim=True).clamp_min(1)
-        score=self.attention(torch.tanh(self.visual(tokens)+self.query(q)[:,None])).squeeze(-1)
-        if self.c['variant'] not in {'baseline','no_mask'}:score=score+mask.flatten(1)
-        attention=score.softmax(-1);attended=(attention[:,:,None]*tokens).sum(1);global_feature=tokens.mean(1)
-        fusion=self.fusion(self.left(attended)*self.right(q));gate=self.gate(torch.cat([attended,q],-1)).sigmoid()
-        if self.c['variant'] in {'baseline','no_gate'}:gate=torch.ones_like(gate)
-        logits=self.answer(self.norm(gate*fusion+(1-gate)*global_feature+q))
-        return {'probability':logits.softmax(-1),'logits':logits,'mask':mask,'attention':attention}
-    def objective(self,b,p):
-        loss=F.cross_entropy(p['logits'],b['y'].long())
-        if self.c['variant'] not in {'baseline','no_localization'}:loss=loss+.5*region(p['mask'],b['mask'].float())
+    """Implement the paper's multiscale attention and low-rank gated fusion."""
+
+    def __init__(self, config, initialize_pretrained=False):
+        super().__init__()
+        self.config = dict(config)
+        width = config.get("width", 128)
+        rank = config.get("rank", 128)
+        self.variant = config.get("variant", "full")
+        self.encoder = Encoder(width, initialize_pretrained and config.get("pretrained", False))
+        self.words = nn.Embedding(config.get("vocabulary", 8192), width, padding_idx=0)
+        self.position = nn.Embedding(24, width)
+        if self.variant == "mobilenet_gru":
+            self.language = nn.GRU(width, width, batch_first=True)
+        else:
+            layer = nn.TransformerEncoderLayer(width, 4, 2*width, dropout=.1, batch_first=True)
+            self.language = nn.TransformerEncoder(layer, 2, enable_nested_tensor=False)
+        if self.variant == "mobilenet_gru":
+            self.baseline_answer = nn.Linear(2*width, 32)
+            self.register_buffer("answer_weight", torch.ones(32))
+            return
+        self.mask = nn.Sequential(nn.Conv2d(width, width, 3, padding=1, groups=width), nn.GroupNorm(8, width), nn.SiLU(), nn.Conv2d(width, 1, 1))
+        self.visual = nn.Linear(width, width)
+        self.query = nn.Linear(width, width)
+        self.attention = nn.Linear(width, 1)
+        self.alpha = nn.Parameter(torch.ones(()))
+        self.left, self.right = nn.Linear(width, rank), nn.Linear(width, rank)
+        self.fusion, self.visual_residual = nn.Linear(rank, width), nn.Linear(width, width)
+        self.query_residual, self.gate = nn.Linear(width, width), nn.Linear(2*width, width)
+        self.norm, self.answer = nn.LayerNorm(width), nn.Linear(width, 32)
+        self.register_buffer("answer_weight", torch.ones(32))
+
+    def forward(self, batch):
+        v8, v16, v32 = self.encoder(batch["x"])
+        token_ids = batch["question"].long()
+        valid = token_ids != 0
+        if token_ids.shape[1] > 24 or not valid.any(-1).all():
+            raise ValueError("Questions require 1..24 tokens including nonpadding content")
+        words = self.words(token_ids)+self.position(torch.arange(token_ids.shape[1], device=token_ids.device))[None]
+        if self.variant == "mobilenet_gru":
+            language, _ = self.language(words)
+        else:
+            language = self.language(words, src_key_padding_mask=~valid)
+        question = (language*valid[..., None]).sum(1)/valid.sum(1, keepdim=True)
+        tokens = v8.flatten(2).transpose(1, 2)
+        if self.variant == "mobilenet_gru":
+            logits = self.baseline_answer(torch.cat([v32.mean((2, 3)), question], -1))
+            mask = torch.zeros_like(v8[:, :1])
+            attention = torch.full_like(tokens[..., 0], 1/tokens.shape[1])
+        else:
+            mask = self.mask(v8).sigmoid()
+            score = self.attention(torch.tanh(self.visual(tokens)+self.query(question)[:, None])).squeeze(-1)
+            if self.variant != "no_mask":
+                score = score+self.alpha*mask.flatten(1)
+            attention = score.softmax(-1)
+            visual = (attention[..., None]*tokens).sum(1)+v16.mean((2, 3))+v32.mean((2, 3))
+            interaction = self.fusion(self.left(visual)*self.right(question))
+            gate = self.gate(torch.cat([visual, question], -1)).sigmoid()
+            if self.variant == "no_gate":
+                gate = torch.ones_like(gate)
+            fused = self.norm(gate*interaction+(1-gate)*self.visual_residual(visual)+self.query_residual(question))
+            logits = self.answer(fused)
+        intent = batch["intent"].long()
+        if ((intent < 0) | (intent >= 5)).any():
+            raise ValueError("Unregistered inspection intent")
+        answer_ids = torch.arange(32, device=logits.device)[None]
+        offsets = torch.tensor(ANSWER_OFFSETS, device=logits.device)
+        allowed = (answer_ids >= offsets[intent, None]) & (answer_ids < offsets[intent+1, None])
+        logits = logits.masked_fill(~allowed, -1e4)
+        return {"logits": logits, "probability": logits.softmax(-1), "mask": mask, "attention": attention}
+
+    def objective(self, batch, prediction):
+        loss = F.cross_entropy(prediction["logits"], batch["y"].long(), weight=self.answer_weight)
+        if self.variant not in {"no_localization", "mobilenet_gru"}:
+            loss = loss+self.config.get("localization_weight", .5)*region(prediction["mask"], batch["mask"])
         return loss
-
-
-def demo(seed,n,c):
-    rng=np.random.default_rng(seed);images=[];masks=[];questions=[];answers=[];groups=[]
-    for scene in range((n+2)//3):
-        image=rng.uniform(.05,.15,(3,32,32)).astype('float32');mask=np.zeros((1,32,32),np.float32)
-        if scene%4:
-            height,width=rng.integers(4,15,size=2);top,left=rng.integers(0,33-height),rng.integers(0,33-width)
-            mask[:,top:top+height,left:left+width]=1;image[:,mask[0]>0]=rng.uniform(.6,.9,(3,1))
-        area=float(mask.mean());location=2 if area==0 else int(np.where(mask[0]>0)[1].mean()>=16)
-        for question,answer in [(1,int(area>0)),(2,location),(3,0 if area==0 else 1 if area<.1 else 2)]:
-            images.append(image.copy());masks.append(mask.copy());questions.append([question,4,0,0,0,0]);answers.append(answer);groups.append(scene)
-    return {'x':np.array(images[:n]),'mask':np.array(masks[:n]),'question':np.array(questions[:n]),'y':np.array(answers[:n]),'group':np.array(groups[:n])}
-
-
-def measure(p,d,c):
-    mask=p['mask']>.5;truth=d['mask']>.5
-    return {'localization_iou':float(np.sum(mask&truth)/max(np.sum(mask|truth),1)),
-            'attention_mask_mass':float((p['attention']*truth.reshape(len(truth),-1)).sum(1).mean())}
