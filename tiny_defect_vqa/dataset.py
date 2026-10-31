@@ -96,9 +96,10 @@ def prepare(manifest, output, seed=11):
 class Questions(torch.utils.data.Dataset):
     """Lazy RGB/mask loader with synchronized geometry and regenerated labels."""
 
-    def __init__(self, path, split, size=256, pretrained=False, augment=False):
+    def __init__(self, path, split, size=256, pretrained=False, augment=False, normalization=None):
         path = Path(path)
         self.root, self.size, self.pretrained, self.augment = path.parent, size, pretrained, augment
+        self.normalization = normalization
         records = json.loads(path.read_text(encoding="utf-8"))
         mapping = {}
         for record in records:
@@ -132,8 +133,10 @@ class Questions(torch.utils.data.Dataset):
         target = np.asarray(mask).copy() > 0
         labels = answers(target, row.get("morphology", "unknown morphology"), row["anomalous"], row.get("logical", False))
         x = torch.from_numpy(np.asarray(image, dtype=np.float32).copy().transpose(2, 0, 1)/255)
-        if self.pretrained:
+        if self.normalization == "clip":
+            x = (x-torch.tensor([.48145466, .4578275, .40821073])[:, None, None])/torch.tensor([.26862954, .26130258, .27577711])[:, None, None]
+        elif self.pretrained:
             x = (x-torch.tensor([.485, .456, .406])[:, None, None])/torch.tensor([.229, .224, .225])[:, None, None]
         question = torch.zeros(24, dtype=torch.long)
         question[:len(row["tokens"])] = torch.tensor(row["tokens"])
-        return {"x": x, "mask": torch.from_numpy(target[None].astype(np.float32)), "question": question, "y": torch.tensor(labels[row["intent"]]), "intent": torch.tensor(row["intent"]), "index": torch.tensor(index)}
+        return {"raw_question": row["question"], "x": x, "mask": torch.from_numpy(target[None].astype(np.float32)), "question": question, "y": torch.tensor(labels[row["intent"]]), "intent": torch.tensor(row["intent"]), "index": torch.tensor(index)}

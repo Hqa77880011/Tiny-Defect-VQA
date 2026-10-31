@@ -83,3 +83,11 @@ class Model(nn.Module):
         if self.variant not in {"no_localization", "mobilenet_gru"}:
             loss = loss+self.config.get("localization_weight", .5)*region(prediction["mask"], batch["mask"])
         return loss
+
+
+def build_model(config, initialize_pretrained=False):
+    """Construct the saved architecture, including contextual task adaptations."""
+    if config.get("variant", "full") in {"mobivqa", "vqa_lite", "efficientad", "blip2", "anomalygpt"}:
+        from .baselines import make
+        return make(config, initialize_pretrained and config.get("pretrained", False))
+    return Model(config, initialize_pretrained)

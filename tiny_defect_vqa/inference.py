@@ -26,7 +26,9 @@ def predict(model, state, image, question, intent, device, tokenizer=None):
     size = state["config"]["size"]
     array = np.asarray(image.resize((size, size), Image.Resampling.BILINEAR), dtype=np.float32).copy().transpose(2, 0, 1)/255
     x = torch.tensor(array, device=device)
-    if state["config"]["pretrained"]:
+    if state["config"].get("normalization") == "clip":
+        x = (x-torch.tensor([.48145466, .4578275, .40821073], device=device)[:, None, None])/torch.tensor([.26862954, .26130258, .27577711], device=device)[:, None, None]
+    elif state["config"]["pretrained"]:
         x = (x-torch.tensor([.485, .456, .406], device=device)[:, None, None])/torch.tensor([.229, .224, .225], device=device)[:, None, None]
     tokenizer = tokenizer if tokenizer is not None else Tokenizer.from_str(state["tokenizer_json"])
     tokens = tokenizer.encode(question).ids[:24]
@@ -35,9 +37,11 @@ def predict(model, state, image, question, intent, device, tokenizer=None):
     ids = torch.zeros((1, 24), dtype=torch.long, device=device)
     ids[0, :len(tokens)] = torch.tensor(tokens, device=device)
     index = INTENTS.index(intent)
-    output = model({"x": x[None], "question": ids, "intent": torch.tensor([index], device=device)})
+    output = model({"x": x[None], "question": ids, "intent": torch.tensor([index], device=device), "raw_question": [question]})
     probability = (output["logits"]/state["temperature"]).softmax(-1).cpu().numpy()
     accepted = scores(probability, state["gate"])[0] >= state["thresholds"][str(index)]
+    if "intrinsic_review" in output:
+        accepted = bool(accepted) and not bool(output["intrinsic_review"][0])
     answer = int(probability.argmax(1)[0])
     mask = torch.nn.functional.interpolate(output["mask"], size=original_size[::-1], mode="bilinear", align_corners=False)[0, 0].cpu().numpy()
     return {"answer": ANSWERS[answer] if accepted else "manual review", "predicted_answer": ANSWERS[answer], "confidence": float(probability.max()), "accepted": bool(accepted)}, mask

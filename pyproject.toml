@@ -12,5 +12,9 @@ dependencies = ["numpy>=1.24", "scipy>=1.10", "torch>=2.2", "torchvision>=0.17",
 [project.scripts]
 tiny-defect-vqa = "tiny_defect_vqa.cli:main"
 
+[project.optional-dependencies]
+foundation = ["transformers>=4.57,<5", "safetensors>=0.6"]
+export = ["onnx>=1.19", "onnxruntime>=1.20"]
+
 [tool.setuptools.packages.find]
 include = ["tiny_defect_vqa*"]

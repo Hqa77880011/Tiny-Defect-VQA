@@ -11,3 +11,5 @@ runs/
 *.joblib
 .env
 .env.*
+
+.deps/

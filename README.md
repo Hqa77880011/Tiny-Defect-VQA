@@ -65,4 +65,43 @@ Training writes `model.pt,history.json`; calibration writes frozen temperature/t
 
 `python -m tiny_defect_vqa.smoke` loads eight generated RGB/mask files, emits 40 image-disjoint five-intent questions, trains the train-only WordPiece, checks full width128 forward/loss/backward and key encoder/Transformer/localizer/alpha/fusion/answer parameter updates, typed-answer masking, checkpoint reload at atol1e-7/rtol1e-6, and each architectural ablation. It then runs one full-width epoch, all three independent calibration gates, locked test evaluation, metric plots and uncached single-image inference/profiling. Functional image size is reduced to 64, and ablation branch checks use width32/rank16; production defaults remain 256/128/128. Hand cases verify extent boundaries, accuracy/coverage/risk/error-capture/ECE and exact permutation p=.0625. These fixtures are code checks, not paper accuracy results.
 
-The original image manifests/morphology mapping and pretrained experiment checkpoints, MobiVQA/VQA-lite/EfficientAD/BLIP-2/AnomalyGPT adapters, complete five-seed runs and TensorRT FP16 deployment are not supplied or executed. The original edge power/memory/latency claims are not asserted by this repository's CPU check. Preserve original dataset terms and use actual telemetry for device comparisons; no performance table is prefilled.
+The original image manifests/morphology mapping, pretrained experiment checkpoints and complete five-seed performance runs remain unavailable. All contextual baselines below have runnable task adaptations. Functional fixtures do not establish the original edge power/memory/latency claims.
+
+## Contextual baselines and matched runs
+
+`train --variant` accepts the following distinct implementations in `baselines.py`; each uses the same frozen records/tokenizer, selection split, calibrated review gate and test denominator. The intended comparison identities are explicitly adaptations rather than claims of exact author checkpoints.
+
+| Variant | Implemented mechanism | Explicit task convention |
+|---|---|---|
+| `mobivqa` | Grid features, question-guided token pruning, first-stage answerability classifier, per-layer answer/exit heads and actual sub-batch early exit | MobileNet/2-layer typed-answer task adaptation; answerability is any-layer-correct and exit target is earliest correct layer; thresholds and retention ratio are configuration parameters |
+| `vqa_lite` | Soft-MoE dispatch/combine over 4 experts×4 slots, inter-slot attention, optional frozen teacher KL distillation | Common compact text/visual encoders replace original T5/SigLIP budgets; `--teacher` must share image size and the frozen tokenizer |
+| `efficientad` | PDN teacher/student, normal-only teacher statistics, 99.9% hard loss, AE reconstruction/student consistency, general-image penalty and 90/99.5% normal-calibration map quantiles | `--feature-checkpoint` supplies actual PDN teacher weights; otherwise the random teacher is only a functional fixture. Deterministic map-to-answer decoder reports unknown morphology and conservative manual disposition; it receives no test masks |
+| `blip2` | Frozen ViT/causal language encoder bridged by learned Q-Former queries and projection, typed answer head | Native small backend is a mechanism check; `--foundation-path` loads actual local Transformers BLIP-2 weights/tokenizer with CLIP normalization. Encoder-decoder and causal LM backends supported; tokenizer and HF architecture are serialized |
+| `anomalygpt` | Frozen patch ViT/language blocks, normal-support patch retrieval, image decoder, anomaly-conditioned prompt learner and q/v LoRA, BCE/Dice localization | Compact native adaptation, not original ImageBind-Huge/Vicuna-7B. Frozen pretrained weights require a locally supplied compatible `--init`; random frozen weights are clearly functional only |
+
+Only methods that produce a localization map enter mask-IoU comparisons. MobiVQA intrinsic review is combined with the independently calibrated confidence gate; its exit depth and processed-token counts are produced by the model. `total_parameters`, `trainable_parameters`, intrinsic review and grounding support are recorded for every evaluated checkpoint.
+
+```bash
+python -m tiny_defect_vqa.cli train --input data/qa/records.json --variant mobivqa --config config.json --epochs 1 --size 256 --output runs/mobivqa
+python -m tiny_defect_vqa.cli train --input data/qa/records.json --variant blip2 --foundation-path /local/blip2 --epochs 1 --size 224 --output runs/blip2
+python -m tiny_defect_vqa.benchmark --input data/qa/records.json --config config.json --methods full mobivqa vqa_lite efficientad blip2 anomalygpt --seeds 11 23 37 41 53 --epochs 1 --size 256 --output runs/paired
+python -m tiny_defect_vqa.smoke_baselines
+# Optional isolated environment: pip install -e '.[foundation,export]'
+python -m tiny_defect_vqa.smoke_hf
+```
+
+`benchmark` runs training/selection, calibration and test sequentially for every explicitly requested epoch budget. It saves all checkpoints/predictions, paired exact permutation tests and Holm adjustment across methods, mean effects and plots. Freeze the prepared WordPiece once across methods/seeds. Rebuilding a WordPiece on tied frequencies can change IDs; a newly prepared tokenizer must never be mixed with an old checkpoint.
+
+Mechanism sources: [MobiVQA author paper](https://netsys.cs.stonybrook.edu/sites/netsys.cs.stonybrook.edu/files/2024-06/mobivqa-compressed.pdf), [VQA-lite publisher](https://www.sciencedirect.com/science/article/pii/S0262885626000697), [EfficientAD](https://arxiv.org/abs/2303.14535), [BLIP-2](https://proceedings.mlr.press/v202/li23q.html), [AnomalyGPT author implementation](https://github.com/CASIA-LMC-Lab/AnomalyGPT). Native adapters were independently implemented; no third-party weights are bundled.
+
+## Verified export and device entry
+
+```bash
+python -m tiny_defect_vqa.deploy export --model runs/full/calibrated.pt --output runs/edge/model.onnx
+python -m tiny_defect_vqa.deploy build --onnx runs/edge/model.onnx --fp16 --workspace-mib 512 --output runs/edge/model.plan
+python -m tiny_defect_vqa.deploy profile --engine runs/edge/model.plan --inputs runs/edge/model.inputs.npz --warmup 100 --iterations 1000 --output runs/edge/tensorrt.json
+```
+
+Export uses fixed image size/batch and 24 padded tokens, opset13 with decomposed attention/LayerNorm, and temporarily disables the unsupported fused PyTorch MHA fast path. It checks the ONNX graph and compares actual ONNX Runtime CPU logits/maps (atol/rtol2e-4). Sidecar JSON retains preprocessing and calibrated temperature/gates. Input-boundary checks remain the caller's responsibility in the fixed graph. Build/profile use actual TensorRT 8.2+ APIs, CUDA events, raw per-iteration times and numerical comparison with saved PyTorch outputs; the binding runner targets TensorRT8.x. This path measures preallocated device tensors only; use `inference` above for request-level timing/power. TensorRT8.2 parser support and FP16 latency/power must be checked on the actual Jetson, and were not executed here.
+
+Additional validation: all five native baselines ran two optimization steps with mechanism-specific gradient/update/frozen-state/reload checks, then one epoch through the shared train→calibrate→evaluate→plot CLI. EfficientAD exercised real general-image penalty inputs, VQA-lite exercised teacher distillation, MobiVQA exercised true early exit and token reduction. Actual Transformers4.57.1 BLIP-2 ran two steps, Q-Former/query/projection updates, frozen vision/LM checks and serialized reconstruction. A two-seed full/MobiVQA one-epoch driver was run. ONNX1.19.1/ONNX Runtime1.22.1 matched the full 64px fixture logits/maps within 5e-7 on full-token and padded-question/intent4 inputs; no GPU deployment or paper performance is inferred.
