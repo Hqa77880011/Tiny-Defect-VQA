@@ -192,7 +192,7 @@ def export(model_path, output, batch=1):
     return report
 
 
-def build(onnx_path, output, fp16=False, workspace_mib=512):
+def build(onnx_path, output, fp16=False, workspace_mib=512, optimization_level=3):
     """Build TensorRT 8.2+ from the verified fixed-shape ONNX model."""
     import tensorrt as trt
 
@@ -209,6 +209,14 @@ def build(onnx_path, output, fp16=False, workspace_mib=512):
                 "\n".join(str(parser.get_error(i)) for i in range(parser.num_errors))
             )
         config = builder.create_builder_config()
+        if not 0 <= optimization_level <= 5:
+            raise ValueError("Builder optimization level must be 0..5")
+        if hasattr(config, "builder_optimization_level"):
+            config.builder_optimization_level = optimization_level
+        elif optimization_level != 3:
+            raise ValueError(
+                "This TensorRT release does not expose builder optimization levels"
+            )
         if hasattr(config, "set_memory_pool_limit"):
             config.set_memory_pool_limit(
                 trt.MemoryPoolType.WORKSPACE, workspace_mib << 20
@@ -227,6 +235,7 @@ def build(onnx_path, output, fp16=False, workspace_mib=512):
     return {
         "tensorrt": trt.__version__,
         "fp16": fp16,
+        "optimization_level": optimization_level,
         "engine_bytes": Path(output).stat().st_size,
     }
 
@@ -240,34 +249,61 @@ def profile(engine_path, inputs_path, warmup=50, iterations=200, tolerance=0.02)
     arrays = np.load(inputs_path)
     logger = trt.Logger(trt.Logger.WARNING)
     with trt.Runtime(logger) as runtime:
+        free_before, total_device_bytes = torch.cuda.mem_get_info()
         engine = runtime.deserialize_cuda_engine(Path(engine_path).read_bytes())
         if engine is None:
             raise RuntimeError("Cannot deserialize engine on this TensorRT/device")
         context = engine.create_execution_context()
-        # Binding API is present in 8.2, the target edge runtime.
-        if not hasattr(engine, "num_bindings"):
-            raise RuntimeError("This runner targets TensorRT 8.x binding APIs")
-        tensors, bindings = {}, [0] * engine.num_bindings
-        for i in range(engine.num_bindings):
-            name = engine.get_binding_name(i)
-            dtype = trt.nptype(engine.get_binding_dtype(i))
-            if engine.binding_is_input(i):
+        legacy = hasattr(engine, "num_bindings")
+        tensors = {}
+        count = engine.num_bindings if legacy else engine.num_io_tensors
+        bindings = [0] * count
+        for i in range(count):
+            name = engine.get_binding_name(i) if legacy else engine.get_tensor_name(i)
+            dtype = trt.nptype(
+                engine.get_binding_dtype(i) if legacy else engine.get_tensor_dtype(name)
+            )
+            is_input = (
+                engine.binding_is_input(i)
+                if legacy
+                else engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+            )
+            shape = tuple(
+                context.get_binding_shape(i)
+                if legacy
+                else context.get_tensor_shape(name)
+            )
+            if any(dimension < 0 for dimension in shape):
+                raise ValueError(
+                    "This exported edge engine requires fixed tensor shapes"
+                )
+            if is_input:
                 value = torch.as_tensor(
                     arrays[name].astype(dtype), device="cuda"
                 ).contiguous()
+                if tuple(value.shape) != shape:
+                    raise ValueError(f"Input shape differs from the engine: {name}")
             else:
                 value = torch.empty(
-                    tuple(context.get_binding_shape(i)),
+                    shape,
                     dtype=torch.from_numpy(np.empty((), dtype=dtype)).dtype,
                     device="cuda",
                 )
             tensors[name], bindings[i] = value, value.data_ptr()
-        stream = torch.cuda.current_stream()
+            if not legacy and not context.set_tensor_address(name, value.data_ptr()):
+                raise RuntimeError(f"Cannot bind TensorRT tensor: {name}")
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
 
         def execute():
-            if not context.execute_async_v2(
-                bindings=bindings, stream_handle=stream.cuda_stream
-            ):
+            success = (
+                context.execute_async_v2(
+                    bindings=bindings, stream_handle=stream.cuda_stream
+                )
+                if legacy
+                else context.execute_async_v3(stream_handle=stream.cuda_stream)
+            )
+            if not success:
                 raise RuntimeError("TensorRT execution failed")
 
         for _ in range(warmup):
@@ -290,6 +326,7 @@ def profile(engine_path, inputs_path, warmup=50, iterations=200, tolerance=0.02)
                 atol=tolerance,
                 rtol=tolerance,
             )
+        free_after, _ = torch.cuda.mem_get_info()
         return {
             "tensorrt": trt.__version__,
             "device": torch.cuda.get_device_name(),
@@ -299,6 +336,21 @@ def profile(engine_path, inputs_path, warmup=50, iterations=200, tolerance=0.02)
             "median_ms": float(np.median(times)),
             "p95_ms": float(np.quantile(times, 0.95)),
             "numerical_tolerance": tolerance,
+            "maximum_absolute_errors": {
+                name: float(np.max(np.abs(tensors[name].cpu().numpy() - arrays[name])))
+                for name in ["logits", "mask"]
+            },
+            "io_api": (
+                "bindings/execute_async_v2"
+                if legacy
+                else "named_tensors/execute_async_v3"
+            ),
+            "device_total_bytes": total_device_bytes,
+            "observed_device_free_delta_bytes": free_before - free_after,
+            "io_tensor_bytes": sum(
+                value.numel() * value.element_size() for value in tensors.values()
+            ),
+            "memory_scope": "free-memory delta includes engine/context/IO and concurrent device activity; not a unique peak or shared Jetson memory measurement",
             "scope": "preallocated device tensors; preprocessing/transfers/QA gate excluded; no power measurement",
         }
 
@@ -313,6 +365,7 @@ def main():
     p.add_argument("--onnx", required=True)
     p.add_argument("--fp16", action="store_true")
     p.add_argument("--workspace-mib", type=int, default=512)
+    p.add_argument("--optimization-level", type=int, default=3)
     p = sub.add_parser("profile")
     p.add_argument("--engine", required=True)
     p.add_argument("--inputs", required=True)
@@ -325,7 +378,13 @@ def main():
     if args.command == "export":
         report = export(args.model, args.output, args.batch)
     elif args.command == "build":
-        report = build(args.onnx, args.output, args.fp16, args.workspace_mib)
+        report = build(
+            args.onnx,
+            args.output,
+            args.fp16,
+            args.workspace_mib,
+            args.optimization_level,
+        )
     else:
         report = profile(
             args.engine, args.inputs, args.warmup, args.iterations, args.tolerance
