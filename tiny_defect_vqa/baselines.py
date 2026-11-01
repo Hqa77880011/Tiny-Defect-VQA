@@ -679,12 +679,21 @@ class HFBlip2(nn.Module):
 
         self.config = dict(config, grounding_supported=False)
         path = config.get("foundation_path")
+        dtype_name = config.get("foundation_dtype", "float32")
+        if dtype_name not in {"float32", "float16"}:
+            raise ValueError("foundation_dtype must be float32 or float16")
+        dtype = getattr(torch, dtype_name)
+        self.restore_from_meta = "hf_config" in config
         if "hf_config" in config:
             model_config = Blip2Config.from_dict(config["hf_config"])
-            self.model = Blip2ForConditionalGeneration(model_config)
+            # A saved multi-billion-parameter model is restored by assignment;
+            # constructing another fully allocated FP32 copy would double RAM.
+            with torch.device("meta"):
+                self.model = Blip2ForConditionalGeneration(model_config)
+            self.model.to(dtype=dtype)
         elif path:
             self.model = Blip2ForConditionalGeneration.from_pretrained(
-                path, local_files_only=True
+                path, local_files_only=True, dtype=dtype, low_cpu_mem_usage=True
             )
             tokenizer = AutoTokenizer.from_pretrained(
                 path, local_files_only=True, use_fast=True
@@ -730,9 +739,15 @@ class HFBlip2(nn.Module):
             # Nonzero random queries avoid degenerate zero-query normalization in
             # the small, unpretrained functional configuration.
             nn.init.normal_(self.model.query_tokens, std=0.02)
+            self.model.to(dtype=dtype)
         self.config["hf_config"] = self.model.config.to_dict()
         self.model.vision_model.requires_grad_(False)
         self.model.language_model.requires_grad_(False)
+        # Keep the trainable bridge/head in FP32 while frozen large modules can
+        # use FP16. Explicit casts at both bridge boundaries preserve gradients.
+        self.model.qformer.float()
+        self.model.language_projection.float()
+        self.model.query_tokens = nn.Parameter(self.model.query_tokens.float())
         language_config = self.model.language_model.config
         width = getattr(language_config, "hidden_size", None) or language_config.d_model
         self.answer = nn.Linear(width, 32)
@@ -745,6 +760,13 @@ class HFBlip2(nn.Module):
                 self.config["foundation_tokenizer_json"]
             )
 
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        result = super().load_state_dict(
+            state_dict, strict=strict, assign=assign or self.restore_from_meta
+        )
+        self.restore_from_meta = False
+        return result
+
     def train(self, mode=True):
         super().train(mode)
         self.model.vision_model.eval()
@@ -753,12 +775,16 @@ class HFBlip2(nn.Module):
 
     def forward(self, batch):
         image = self.model.vision_model(
-            pixel_values=batch["x"], interpolate_pos_encoding=True, return_dict=True
+            pixel_values=batch["x"].to(
+                dtype=next(self.model.vision_model.parameters()).dtype
+            ),
+            interpolate_pos_encoding=True,
+            return_dict=True,
         ).last_hidden_state
         queries = self.model.query_tokens.expand(len(image), -1, -1)
         q = self.model.qformer(
             query_embeds=queries,
-            encoder_hidden_states=image,
+            encoder_hidden_states=image.to(dtype=queries.dtype),
             encoder_attention_mask=torch.ones(
                 image.shape[:2], dtype=torch.long, device=image.device
             ),
@@ -785,7 +811,7 @@ class HFBlip2(nn.Module):
                 ids[index, : len(tokens)] = torch.tensor(tokens, device=image.device)
                 valid[index, : len(tokens)] = True
         embedding = self.model.language_model.get_input_embeddings()(ids)
-        embeddings = torch.cat([prefix, embedding], 1)
+        embeddings = torch.cat([prefix.to(dtype=embedding.dtype), embedding], 1)
         attention_mask = torch.cat(
             [
                 torch.ones(prefix.shape[:2], dtype=torch.bool, device=image.device),
@@ -807,7 +833,9 @@ class HFBlip2(nn.Module):
             ).last_hidden_state
         position = prefix.shape[1] + valid.sum(-1) - 1
         pooled = hidden[torch.arange(len(image), device=image.device), position]
-        logits = typed(self.answer(pooled), batch["intent"])
+        logits = typed(
+            self.answer(pooled.to(dtype=self.answer.weight.dtype)), batch["intent"]
+        )
         return {
             "logits": logits,
             "probability": logits.softmax(-1),

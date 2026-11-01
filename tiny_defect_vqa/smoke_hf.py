@@ -1,18 +1,24 @@
 """Optional actual Transformers BLIP-2 architecture/gradient/checkpoint check."""
 
 from pathlib import Path
+import argparse
 import json
 import torch
 from .method import build_model
+from .cli import load
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dtype", choices=["float32", "float16"], default="float32")
+    args = parser.parse_args()
     torch.set_num_threads(1)
     torch.manual_seed(13)
     model = build_model(
         dict(
             variant="blip2",
             foundation_backend="huggingface",
+            foundation_dtype=args.dtype,
             foundation_width=32,
             vision_layers=1,
             language_layers=1,
@@ -52,9 +58,12 @@ def main():
     torch.save(
         {"config": model.config, "state": model.state_dict()}, root / "hf_blip2.pt"
     )
-    state = torch.load(root / "hf_blip2.pt", weights_only=True)
-    restored = build_model(state["config"])
-    restored.load_state_dict(state["state"])
+    restored, _ = load(root / "hf_blip2.pt", "cpu")
+    assert not any(value.is_meta for value in restored.parameters())
+    assert next(restored.model.vision_model.parameters()).dtype == getattr(
+        torch, args.dtype
+    )
+    assert restored.model.query_tokens.dtype == torch.float32
     model.eval()
     restored.eval()
     with torch.no_grad():
@@ -69,6 +78,9 @@ def main():
             {
                 "actual_transformers_blip2": True,
                 "steps": 2,
+                "frozen_dtype": args.dtype,
+                "bridge_dtype": "float32",
+                "meta_restore_verified": True,
                 "loss": float(loss.detach()),
                 "pretrained_weights_used": False,
             }

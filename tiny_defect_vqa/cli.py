@@ -47,8 +47,13 @@ def collect(model, dataset, batch_size, device, grounding=False):
 
 def load(path, device):
     state = torch.load(path, map_location=device, weights_only=True)
-    model = build_model(state["config"]).to(device)
-    model.load_state_dict(state["state"])
+    model = build_model(state["config"])
+    if getattr(model, "restore_from_meta", False):
+        model.load_state_dict(state["state"], assign=True)
+        model.to(device)
+    else:
+        model.to(device)
+        model.load_state_dict(state["state"])
     model.eval()
     return model, state
 
@@ -73,6 +78,7 @@ def main():
     training.add_argument("--lr", type=float, default=3e-4)
     training.add_argument("--pretrained", action="store_true")
     training.add_argument("--foundation-path", help="Local Hugging Face BLIP-2 model/tokenizer directory")
+    training.add_argument("--foundation-dtype", choices=["float32", "float16"], default="float32")
     training.add_argument("--init", help="Locally supplied compatible baseline checkpoint")
     training.add_argument("--feature-checkpoint", help="EfficientAD PDN teacher state dictionary")
     training.add_argument("--penalty-images", help="Independent general-image folder for EfficientAD penalty")
@@ -118,7 +124,7 @@ def main():
         if args.foundation_path:
             if args.variant != "blip2":
                 raise ValueError("This pretrained foundation backend is BLIP-2")
-            config.update(foundation_backend="huggingface", foundation_path=args.foundation_path, normalization="clip")
+            config.update(foundation_backend="huggingface", foundation_path=args.foundation_path, foundation_dtype=args.foundation_dtype, normalization="clip")
         config.update(variant=args.variant, pretrained=args.pretrained, size=args.size)
         dataset = Questions(args.input, "train", args.size, args.pretrained, augment=True, normalization=config.get("normalization"))
         validation = Questions(args.input, "selection", args.size, args.pretrained, normalization=config.get("normalization"))
