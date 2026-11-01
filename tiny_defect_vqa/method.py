@@ -8,7 +8,7 @@ ANSWER_OFFSETS = (0, 2, 15, 25, 29, 32)
 
 
 class Model(nn.Module):
-    """Implement the paper's multiscale attention and low-rank gated fusion."""
+    """Multiscale attention and low-rank gated fusion."""
 
     def __init__(self, config, initialize_pretrained=False):
         super().__init__()

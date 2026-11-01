@@ -1,4 +1,4 @@
-"""Executable task adaptations of the paper's contextual comparison methods.
+"""Compact comparison methods for mask-grounded defect VQA.
 
 Widths, pretrained-state paths and task-specific decoders are explicit configuration
 choices; compact random initialization is solely a functional-check setting.

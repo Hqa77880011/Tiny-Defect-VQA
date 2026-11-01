@@ -13,3 +13,4 @@ runs/
 .env.*
 
 .deps/
+models/
